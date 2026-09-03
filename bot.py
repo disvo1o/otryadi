@@ -4,14 +4,15 @@ import os
 import random
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command
 from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
 )
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -28,12 +29,33 @@ from database import Base, Participant, Squad
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не указан")
+    raise RuntimeError(
+        "Не указана переменная BOT_TOKEN"
+    )
+
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не указан")
+    raise RuntimeError(
+        "Не указана переменная DATABASE_URL"
+    )
 
+
+if not ADMIN_TELEGRAM_ID:
+    raise RuntimeError(
+        "Не указана переменная ADMIN_TELEGRAM_ID"
+    )
+
+
+ADMIN_TELEGRAM_ID = int(ADMIN_TELEGRAM_ID)
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,18 +100,32 @@ main_keyboard = ReplyKeyboardMarkup(
 
 
 # ============================================================
+# ПРОВЕРКА АДМИНИСТРАТОРА
+# ============================================================
+
+def is_admin(message: Message) -> bool:
+
+    return (
+        message.from_user.id
+        == ADMIN_TELEGRAM_ID
+    )
+
+
+# ============================================================
 # START
 # ============================================================
 
-@dp.message(CommandStart())
-async def start_handler(message: Message):
+@dp.message(Command("start"))
+async def start_handler(
+    message: Message,
+):
 
     await message.answer(
         "Привет! 👋\n\n"
-        "Тебе нужно получить свой отряд.\n\n"
-        "Нажми кнопку «🎯 Получить свой отряд».\n\n"
-        "Важно: отряд определяется случайным образом "
-        "и после получения изменить его нельзя.",
+        "Здесь ты можешь получить свой отряд.\n\n"
+        "Нажми кнопку ниже.\n\n"
+        "⚠️ Отряд определяется случайным образом.\n"
+        "После получения изменить его нельзя.",
         reply_markup=main_keyboard,
     )
 
@@ -98,176 +134,360 @@ async def start_handler(message: Message):
 # ПОЛУЧЕНИЕ ОТРЯДА
 # ============================================================
 
-@dp.message(F.text == "🎯 Получить свой отряд")
-async def get_squad_handler(message: Message):
+@dp.message(
+    F.text == "🎯 Получить свой отряд"
+)
+async def get_squad_handler(
+    message: Message,
+):
 
     telegram_id = message.from_user.id
 
     async with SessionLocal() as session:
 
-        # ----------------------------------------------------
-        # Проверяем, получал ли пользователь отряд раньше
-        # ----------------------------------------------------
+        # ====================================================
+        # 1. ПРОВЕРЯЕМ, ЕСТЬ ЛИ УЖЕ РАСПРЕДЕЛЕНИЕ
+        # ====================================================
 
-        existing_participant = await session.scalar(
+        existing = await session.scalar(
             select(Participant)
             .where(
-                Participant.telegram_id == telegram_id
+                Participant.telegram_id
+                == telegram_id
             )
         )
 
-        if existing_participant:
+        if existing:
 
             squad = await session.get(
                 Squad,
-                existing_participant.squad_id,
+                existing.squad_id,
             )
 
             if squad:
 
                 await message.answer(
                     "⚠️ Ты уже получил свой отряд.\n\n"
-                    f"🎯 Твой отряд: {squad.name}\n\n"
-                    f"🔗 Ссылка:\n{squad.invite_link}\n\n"
+                    f"🎯 <b>{squad.name}</b>\n\n"
+                    f"🔗 {squad.invite_link}\n\n"
                     "Получить другой отряд невозможно.",
+                    parse_mode="HTML",
                     reply_markup=main_keyboard,
                 )
 
             return
 
-        # ----------------------------------------------------
-        # Получаем свободные отряды
-        # ----------------------------------------------------
+        # ====================================================
+        # 2. НАЧИНАЕМ TRANSACTION
+        # ====================================================
 
-        squads = list(
-            (
-                await session.scalars(
-                    select(Squad)
-                    .where(Squad.members_count < 20)
+        try:
+
+            # ------------------------------------------------
+            # Сначала блокируем ВСЕ строки отрядов.
+            #
+            # Это не позволяет нескольким параллельным
+            # запросам одновременно изменить количество
+            # участников.
+            # ------------------------------------------------
+
+            squads = list(
+                (
+                    await session.scalars(
+                        select(Squad)
+                        .order_by(Squad.id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+
+            if not squads:
+
+                await message.answer(
+                    "❌ Отряды ещё не настроены.",
+                    reply_markup=main_keyboard,
                 )
-            ).all()
-        )
 
-        if not squads:
+                return
 
-            await message.answer(
-                "❌ Все отряды уже заполнены.\n\n"
-                "Всего доступно 200 мест.",
-                reply_markup=main_keyboard,
+            # ------------------------------------------------
+            # Проверяем свободные места
+            # ------------------------------------------------
+
+            free_slots = []
+
+            for squad in squads:
+
+                if squad.members_count >= 20:
+                    continue
+
+                free_places = (
+                    20
+                    - squad.members_count
+                )
+
+                for _ in range(
+                    free_places
+                ):
+
+                    free_slots.append(
+                        squad
+                    )
+
+            # ------------------------------------------------
+            # Все 200 мест заняты
+            # ------------------------------------------------
+
+            if not free_slots:
+
+                await message.answer(
+                    "❌ Все 10 отрядов уже заполнены.\n\n"
+                    "Всего доступно 200 мест.",
+                    reply_markup=main_keyboard,
+                )
+
+                return
+
+            # =================================================
+            # 3. RANDOM
+            # =================================================
+
+            selected_squad = random.choice(
+                free_slots
             )
 
-            return
+            # =================================================
+            # 4. СОЗДАЁМ УЧАСТНИКА
+            # =================================================
 
-        # ----------------------------------------------------
-        # Создаём список свободных мест
-        #
-        # Если:
-        #
-        # Отряд 1 = 20
-        # Отряд 2 = 15
-        # Отряд 3 = 10
-        #
-        # то случай выбирается среди свободных мест.
-        #
-        # Это сохраняет случайность, но гарантирует максимум 20.
-        # ----------------------------------------------------
-
-        free_slots = []
-
-        for squad in squads:
-
-            free_places = 20 - squad.members_count
-
-            for _ in range(free_places):
-                free_slots.append(squad.id)
-
-        if not free_slots:
-
-            await message.answer(
-                "❌ Все места уже заняты.",
-                reply_markup=main_keyboard,
+            participant = Participant(
+                telegram_id=telegram_id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+                squad_id=selected_squad.id,
             )
 
-            return
+            session.add(
+                participant
+            )
 
-        # ----------------------------------------------------
-        # RANDOM
-        # ----------------------------------------------------
+            selected_squad.members_count += 1
 
-        selected_squad_id = random.choice(
-            free_slots
-        )
+            # =================================================
+            # 5. COMMIT
+            # =================================================
 
-        selected_squad = await session.get(
-            Squad,
-            selected_squad_id,
-            with_for_update=True,
-        )
+            await session.commit()
 
-        # ----------------------------------------------------
-        # Повторная проверка после блокировки
-        # ----------------------------------------------------
-
-        if selected_squad.members_count >= 20:
+        except IntegrityError:
 
             await session.rollback()
 
+            # Такая ситуация может возникнуть,
+            # если пользователь нажал кнопку несколько раз
+            # одновременно.
+
+            existing = await session.scalar(
+                select(Participant)
+                .where(
+                    Participant.telegram_id
+                    == telegram_id
+                )
+            )
+
+            if existing:
+
+                squad = await session.get(
+                    Squad,
+                    existing.squad_id,
+                )
+
+                await message.answer(
+                    "⚠️ Ты уже получил свой отряд.\n\n"
+                    f"🎯 <b>{squad.name}</b>\n\n"
+                    f"🔗 {squad.invite_link}",
+                    parse_mode="HTML",
+                    reply_markup=main_keyboard,
+                )
+
+            else:
+
+                await message.answer(
+                    "Произошла ошибка.\n"
+                    "Попробуй нажать кнопку ещё раз.",
+                    reply_markup=main_keyboard,
+                )
+
+            return
+
+        except Exception:
+
+            await session.rollback()
+
+            logger.exception(
+                "Ошибка распределения"
+            )
+
             await message.answer(
-                "Произошла небольшая ошибка распределения.\n"
-                "Нажми кнопку ещё раз.",
+                "Произошла техническая ошибка.\n"
+                "Попробуй ещё раз.",
                 reply_markup=main_keyboard,
             )
 
             return
 
-        # ----------------------------------------------------
-        # Создаём участника
-        # ----------------------------------------------------
-
-        participant = Participant(
-            telegram_id=telegram_id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-            squad_id=selected_squad.id,
-        )
-
-        # Увеличиваем количество участников
-        selected_squad.members_count += 1
-
-        session.add(participant)
-
-        await session.commit()
-
-        logger.info(
-            "User %s assigned to squad %s",
-            telegram_id,
-            selected_squad.name,
-        )
-
-        # ----------------------------------------------------
-        # Отправляем результат
-        # ----------------------------------------------------
+        # ====================================================
+        # 6. ОТПРАВЛЯЕМ РЕЗУЛЬТАТ
+        # ====================================================
 
         await message.answer(
-            "🎉 Распределение завершено!\n\n"
+            "🎉 <b>Распределение завершено!</b>\n\n"
             f"🎯 Твой отряд:\n"
             f"<b>{selected_squad.name}</b>\n\n"
             f"🔗 Ссылка на отряд:\n"
             f"{selected_squad.invite_link}\n\n"
             "⚠️ Сохрани ссылку.\n"
             "Получить другой отряд повторно нельзя.",
-            reply_markup=main_keyboard,
             parse_mode="HTML",
+            reply_markup=main_keyboard,
         )
 
 
 # ============================================================
-# ОБРАБОТКА ЛЮБОГО ДРУГОГО ТЕКСТА
+# ADMIN
+# ============================================================
+
+@dp.message(Command("admin"))
+async def admin_handler(
+    message: Message,
+):
+
+    if not is_admin(message):
+
+        await message.answer(
+            "⛔ У тебя нет доступа."
+        )
+
+        return
+
+    async with SessionLocal() as session:
+
+        squads = list(
+            (
+                await session.scalars(
+                    select(Squad)
+                    .order_by(Squad.id)
+                )
+            ).all()
+        )
+
+        total = await session.scalar(
+            select(
+                func.count(
+                    Participant.id
+                )
+            )
+        )
+
+    text = (
+        "📊 <b>СТАТИСТИКА</b>\n\n"
+        f"Всего участников: "
+        f"<b>{total}/200</b>\n\n"
+    )
+
+    for squad in squads:
+
+        text += (
+            f"🎯 {squad.name}: "
+            f"<b>{squad.members_count}/20</b>\n"
+        )
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+@dp.message(Command("reset"))
+async def reset_handler(
+    message: Message,
+):
+
+    if not is_admin(message):
+
+        await message.answer(
+            "⛔ У тебя нет доступа."
+        )
+
+        return
+
+    async with SessionLocal() as session:
+
+        await session.execute(
+            delete(Participant)
+        )
+
+        squads = list(
+            (
+                await session.scalars(
+                    select(Squad)
+                    .order_by(Squad.id)
+                )
+            ).all()
+        )
+
+        for squad in squads:
+
+            squad.members_count = 0
+
+        await session.commit()
+
+    await message.answer(
+        "♻️ Распределение полностью сброшено.\n\n"
+        "Теперь можно запускать жеребьёвку заново."
+    )
+
+
+# ============================================================
+# ADMIN HELP
+# ============================================================
+
+@dp.message(Command("help"))
+async def help_handler(
+    message: Message,
+):
+
+    if is_admin(message):
+
+        await message.answer(
+            "🔐 <b>Команды администратора</b>\n\n"
+            "/admin — статистика\n"
+            "/reset — полностью сбросить распределение\n",
+            parse_mode="HTML",
+        )
+
+    else:
+
+        await message.answer(
+            "Чтобы получить отряд, нажми:\n\n"
+            "🎯 Получить свой отряд",
+            reply_markup=main_keyboard,
+        )
+
+
+# ============================================================
+# ЛЮБОЙ ДРУГОЙ ТЕКСТ
 # ============================================================
 
 @dp.message()
-async def other_message_handler(message: Message):
+async def other_message_handler(
+    message: Message,
+):
 
     telegram_id = message.from_user.id
 
@@ -276,7 +496,8 @@ async def other_message_handler(message: Message):
         participant = await session.scalar(
             select(Participant)
             .where(
-                Participant.telegram_id == telegram_id
+                Participant.telegram_id
+                == telegram_id
             )
         )
 
@@ -291,23 +512,23 @@ async def other_message_handler(message: Message):
 
                 await message.answer(
                     "Твой отряд уже определён.\n\n"
-                    f"🎯 {squad.name}\n\n"
+                    f"🎯 <b>{squad.name}</b>\n\n"
                     f"🔗 {squad.invite_link}\n\n"
                     "Изменить отряд нельзя.",
+                    parse_mode="HTML",
                     reply_markup=main_keyboard,
                 )
 
             return
 
     await message.answer(
-        "Чтобы получить отряд, нажми кнопку:\n\n"
-        "🎯 Получить свой отряд",
+        "Нажми кнопку ниже, чтобы получить отряд.",
         reply_markup=main_keyboard,
     )
 
 
 # ============================================================
-# СОЗДАНИЕ БАЗЫ
+# INITIALIZE DATABASE
 # ============================================================
 
 async def init_database():
@@ -319,7 +540,7 @@ async def init_database():
         )
 
     # --------------------------------------------------------
-    # Создаём 10 отрядов, если их ещё нет
+    # Получаем ссылки
     # --------------------------------------------------------
 
     links = []
@@ -338,9 +559,28 @@ async def init_database():
 
         links.append(link)
 
+    # --------------------------------------------------------
+    # Названия
+    # --------------------------------------------------------
+
+    names = []
+
+    for i in range(1, 11):
+
+        name = os.getenv(
+            f"SQUAD_{i}_NAME",
+            f"Отряд {i}",
+        )
+
+        names.append(name)
+
+    # --------------------------------------------------------
+    # Создаём отряды
+    # --------------------------------------------------------
+
     async with SessionLocal() as session:
 
-        existing = list(
+        squads = list(
             (
                 await session.scalars(
                     select(Squad)
@@ -349,17 +589,18 @@ async def init_database():
             ).all()
         )
 
-        if not existing:
+        # Если база пустая
+        if not squads:
 
             for i in range(10):
 
-                squad = Squad(
-                    name=f"Отряд {i + 1}",
-                    invite_link=links[i],
-                    members_count=0,
+                session.add(
+                    Squad(
+                        name=names[i],
+                        invite_link=links[i],
+                        members_count=0,
+                    )
                 )
-
-                session.add(squad)
 
             await session.commit()
 
@@ -369,9 +610,16 @@ async def init_database():
 
         else:
 
-            # Обновляем ссылки из ENV.
-            for i, squad in enumerate(existing[:10]):
+            # Обновляем названия и ссылки.
+            #
+            # ВАЖНО:
+            # members_count здесь НЕ трогаем.
 
+            for i, squad in enumerate(
+                squads[:10]
+            ):
+
+                squad.name = names[i]
                 squad.invite_link = links[i]
 
             await session.commit()
@@ -390,7 +638,7 @@ async def main():
     )
 
     logger.info(
-        "Bot started"
+        "Telegram bot started"
     )
 
     await dp.start_polling(
