@@ -1,297 +1,449 @@
-import csv
-import io
-import os
-from functools import wraps
+<!DOCTYPE html>
+<html lang="ru">
 
-from flask import (
-    Flask,
-    Response,
-    request,
-    render_template,
-)
+<head>
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+<meta charset="UTF-8">
 
-from database import Participant, Squad
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
+<title>
+    Отряды
+</title>
 
-# ============================================================
-# SETTINGS
-# ============================================================
+<style>
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+* {
+    box-sizing: border-box;
+}
 
-ADMIN_USER = os.getenv(
-    "ADMIN_USER",
-    "admin",
-)
+body {
 
-ADMIN_PASSWORD = os.getenv(
-    "ADMIN_PASSWORD",
-)
+    margin: 0;
 
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL не указан"
-    )
+    background: #f4f5f7;
 
-if not ADMIN_PASSWORD:
-    raise RuntimeError(
-        "ADMIN_PASSWORD не указан"
-    )
+    color: #171717;
+
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+}
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+header {
 
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
+    background: white;
 
-SessionLocal = async_sessionmaker(
-    engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
-)
+    border-bottom:
+        1px solid #ddd;
 
+    padding:
+        20px 28px;
 
-# ============================================================
-# FLASK
-# ============================================================
+    display: flex;
 
-app = Flask(__name__)
+    align-items: center;
+
+    justify-content:
+        space-between;
+
+    gap: 20px;
+}
 
 
-# ============================================================
-# AUTH
-# ============================================================
+h1 {
 
-def admin_required(function):
+    margin:
+        0 0 5px 0;
 
-    @wraps(function)
-    def wrapper(*args, **kwargs):
-
-        auth = request.authorization
-
-        if not auth:
-
-            return Response(
-                "Требуется авторизация",
-                401,
-                {
-                    "WWW-Authenticate":
-                    'Basic realm="Admin"'
-                },
-            )
-
-        if auth.username != ADMIN_USER:
-            return Response(
-                "Неверный логин",
-                401,
-                {
-                    "WWW-Authenticate":
-                    'Basic realm="Admin"'
-                },
-            )
-
-        if auth.password != ADMIN_PASSWORD:
-
-            return Response(
-                "Неверный пароль",
-                401,
-                {
-                    "WWW-Authenticate":
-                    'Basic realm="Admin"'
-                },
-            )
-
-        return function(
-            *args,
-            **kwargs,
-        )
-
-    return wrapper
+    font-size: 25px;
+}
 
 
-# ============================================================
-# MAIN PAGE
-# ============================================================
+.subtitle {
 
-@app.get("/")
-@admin_required
-async def dashboard():
+    color: #666;
 
-    async with SessionLocal() as session:
-
-        squads = list(
-            (
-                await session.scalars(
-                    select(Squad)
-                    .order_by(Squad.id)
-                )
-            ).all()
-        )
-
-        participants = list(
-            (
-                await session.scalars(
-                    select(Participant)
-                    .order_by(
-                        Participant.squad_id,
-                        Participant.id,
-                    )
-                )
-            ).all()
-        )
-
-    by_squad = {}
-
-    for squad in squads:
-
-        by_squad[squad.id] = []
-
-    for participant in participants:
-
-        by_squad.setdefault(
-            participant.squad_id,
-            [],
-        ).append(
-            participant
-        )
-
-    return await render_template(
-        "index.html",
-        squads=squads,
-        by_squad=by_squad,
-        total=len(participants),
-    )
+    font-size: 14px;
+}
 
 
-# ============================================================
-# CSV EXPORT
-# ============================================================
+.button {
 
-@app.get("/export.csv")
-@admin_required
-async def export_csv():
+    display: inline-block;
 
-    async with SessionLocal() as session:
+    padding:
+        10px 15px;
 
-        squads = list(
-            (
-                await session.scalars(
-                    select(Squad)
-                    .order_by(Squad.id)
-                )
-            ).all()
-        )
+    background: #171717;
 
-        participants = list(
-            (
-                await session.scalars(
-                    select(Participant)
-                    .order_by(
-                        Participant.squad_id,
-                        Participant.id,
-                    )
-                )
-            ).all()
-        )
+    color: white;
 
-    squad_names = {
-        squad.id: squad.name
-        for squad in squads
+    text-decoration: none;
+
+    border-radius: 8px;
+
+    font-size: 14px;
+}
+
+
+.container {
+
+    padding: 24px;
+}
+
+
+.stats {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            5,
+            1fr
+        );
+
+    gap: 12px;
+
+    margin-bottom: 24px;
+}
+
+
+.stat {
+
+    background: white;
+
+    border:
+        1px solid #e2e2e2;
+
+    border-radius: 10px;
+
+    padding: 14px;
+}
+
+
+.stat-title {
+
+    color: #666;
+
+    font-size: 13px;
+}
+
+
+.stat-value {
+
+    font-size: 22px;
+
+    font-weight: 700;
+
+    margin-top: 4px;
+}
+
+
+.grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            5,
+            minmax(220px, 1fr)
+        );
+
+    gap: 16px;
+}
+
+
+.squad {
+
+    background: white;
+
+    border:
+        1px solid #e1e1e1;
+
+    border-radius: 12px;
+
+    padding: 16px;
+
+    min-height: 180px;
+}
+
+
+.squad-header {
+
+    display: flex;
+
+    justify-content:
+        space-between;
+
+    align-items: center;
+
+    margin-bottom: 10px;
+}
+
+
+.squad-name {
+
+    font-size: 17px;
+
+    font-weight: 700;
+}
+
+
+.count {
+
+    background: #f0f0f0;
+
+    border-radius: 6px;
+
+    padding:
+        5px 8px;
+
+    color: #666;
+
+    font-size: 12px;
+}
+
+
+.person {
+
+    border-top:
+        1px solid #eee;
+
+    padding:
+        9px 0;
+}
+
+
+.person-name {
+
+    font-weight: 600;
+
+    font-size: 14px;
+}
+
+
+.person-username {
+
+    color: #777;
+
+    font-size: 12px;
+
+    margin-top: 2px;
+}
+
+
+.empty {
+
+    color: #aaa;
+
+    padding-top: 8px;
+
+    font-size: 13px;
+}
+
+
+@media (max-width: 1100px) {
+
+    .stats {
+
+        grid-template-columns:
+            repeat(
+                3,
+                1fr
+            );
     }
 
-    output = io.StringIO()
+    .grid {
 
-    writer = csv.writer(
-        output
-    )
-
-    writer.writerow(
-        [
-            "Отряд",
-            "Имя",
-            "Фамилия",
-            "Никнейм",
-            "Telegram ID",
-        ]
-    )
-
-    for participant in participants:
-
-        username = ""
-
-        if participant.username:
-
-            username = (
-                "@"
-                + participant.username
-            )
-
-        writer.writerow(
-            [
-                squad_names.get(
-                    participant.squad_id,
-                    "",
-                ),
-                participant.first_name or "",
-                participant.last_name or "",
-                username,
-                participant.telegram_id,
-            ]
-        )
-
-    content = (
-        "\ufeff"
-        + output.getvalue()
-    )
-
-    return Response(
-        content,
-        mimetype="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition":
-            "attachment; "
-            "filename=participants.csv"
-        },
-    )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "ok"
+        grid-template-columns:
+            repeat(
+                3,
+                minmax(220px, 1fr)
+            );
     }
 
+}
 
-# ============================================================
-# LOCAL
-# ============================================================
 
-if __name__ == "__main__":
+@media (max-width: 700px) {
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8080",
-        )
-    )
+    header {
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-    )
+        flex-direction:
+            column;
+
+        align-items:
+            flex-start;
+    }
+
+    .stats {
+
+        grid-template-columns:
+            repeat(
+                2,
+                1fr
+            );
+    }
+
+    .grid {
+
+        grid-template-columns:
+            1fr;
+    }
+
+}
+
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+    <div>
+
+        <h1>
+            Распределение по отрядам
+        </h1>
+
+        <div class="subtitle">
+
+            Всего участников:
+            <strong>
+                {{ total }}/200
+            </strong>
+
+        </div>
+
+    </div>
+
+
+    <a
+        class="button"
+        href="/export.csv"
+    >
+        Скачать CSV
+    </a>
+
+</header>
+
+
+<div class="container">
+
+
+    <div class="stats">
+
+        {% for squad in squads %}
+
+        <div class="stat">
+
+            <div class="stat-title">
+
+                {{ squad.name }}
+
+            </div>
+
+            <div class="stat-value">
+
+                {{ squad.members_count }}/20
+
+            </div>
+
+        </div>
+
+        {% endfor %}
+
+    </div>
+
+
+    <div class="grid">
+
+
+        {% for squad in squads %}
+
+        <div class="squad">
+
+
+            <div class="squad-header">
+
+                <div class="squad-name">
+
+                    {{ squad.name }}
+
+                </div>
+
+                <div class="count">
+
+                    {{ squad.members_count }}/20
+
+                </div>
+
+            </div>
+
+
+            {% for participant in by_squad[squad.id] %}
+
+            <div class="person">
+
+                <div class="person-name">
+
+                    {{ participant.first_name or "" }}
+
+                    {{ participant.last_name or "" }}
+
+                </div>
+
+
+                <div class="person-username">
+
+                    {% if participant.username %}
+
+                        @{{ participant.username }}
+
+                    {% else %}
+
+                        username отсутствует
+
+                    {% endif %}
+
+                </div>
+
+            </div>
+
+            {% else %}
+
+            <div class="empty">
+
+                Пока никого нет
+
+            </div>
+
+            {% endfor %}
+
+
+        </div>
+
+        {% endfor %}
+
+
+    </div>
+
+
+</div>
+
+
+</body>
+
+</html>
