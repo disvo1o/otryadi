@@ -6,11 +6,12 @@ from functools import wraps
 from flask import (
     Flask,
     Response,
-    request,
     render_template,
+    request,
 )
 
 from sqlalchemy import select
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -24,7 +25,9 @@ from database import Participant, Squad
 # SETTINGS
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL"
+)
 
 ADMIN_USER = os.getenv(
     "ADMIN_USER",
@@ -32,15 +35,19 @@ ADMIN_USER = os.getenv(
 )
 
 ADMIN_PASSWORD = os.getenv(
-    "ADMIN_PASSWORD",
+    "ADMIN_PASSWORD"
 )
 
+
 if not DATABASE_URL:
+
     raise RuntimeError(
         "DATABASE_URL не указан"
     )
 
+
 if not ADMIN_PASSWORD:
+
     raise RuntimeError(
         "ADMIN_PASSWORD не указан"
     )
@@ -66,49 +73,55 @@ SessionLocal = async_sessionmaker(
 # FLASK
 # ============================================================
 
-app = Flask(__name__)
+app = Flask(
+    __name__
+)
 
 
 # ============================================================
-# AUTH
+# BASIC AUTH
 # ============================================================
 
 def admin_required(function):
 
     @wraps(function)
-    def wrapper(*args, **kwargs):
+    def wrapper(
+        *args,
+        **kwargs,
+    ):
 
         auth = request.authorization
 
         if not auth:
 
             return Response(
-                "Требуется авторизация",
+                "Authentication required",
                 401,
                 {
                     "WWW-Authenticate":
-                    'Basic realm="Admin"'
+                    'Basic realm="Admin"',
                 },
             )
 
         if auth.username != ADMIN_USER:
+
             return Response(
-                "Неверный логин",
+                "Invalid username",
                 401,
                 {
                     "WWW-Authenticate":
-                    'Basic realm="Admin"'
+                    'Basic realm="Admin"',
                 },
             )
 
         if auth.password != ADMIN_PASSWORD:
 
             return Response(
-                "Неверный пароль",
+                "Invalid password",
                 401,
                 {
                     "WWW-Authenticate":
-                    'Basic realm="Admin"'
+                    'Basic realm="Admin"',
                 },
             )
 
@@ -121,7 +134,7 @@ def admin_required(function):
 
 
 # ============================================================
-# MAIN PAGE
+# DASHBOARD
 # ============================================================
 
 @app.get("/")
@@ -175,7 +188,7 @@ async def dashboard():
 
 
 # ============================================================
-# CSV EXPORT
+# CSV
 # ============================================================
 
 @app.get("/export.csv")
@@ -250,24 +263,20 @@ async def export_csv():
             ]
         )
 
-    content = (
-        "\ufeff"
-        + output.getvalue()
-    )
-
     return Response(
-        content,
+        "\ufeff"
+        + output.getvalue(),
         mimetype="text/csv; charset=utf-8",
         headers={
             "Content-Disposition":
             "attachment; "
-            "filename=participants.csv"
+            "filename=participants.csv",
         },
     )
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -279,7 +288,7 @@ async def health():
 
 
 # ============================================================
-# LOCAL
+# LOCAL START
 # ============================================================
 
 if __name__ == "__main__":
