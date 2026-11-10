@@ -1,8 +1,11 @@
 import asyncio
 import html
+import json
 import os
 import random
 
+import gspread
+from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -12,91 +15,143 @@ from aiogram.types import (
     Message,
     User,
 )
-from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-from database import Base, Participant, Squad
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+GOOGLE_SHEET_ID = os.getenv(
+    "GOOGLE_SHEET_ID",
+    "1o5tdrhdUfkDuugVi8FqnbNp_0eyzsUNIaOeE2nbiLeg",
+)
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
 CAPACITY_PER_SQUAD = 10
 SQUAD_COUNT = 10
+HEADERS = ["Команда", "Имя", "Фамилия", "Username", "Telegram ID"]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
-# Railway PostgreSQL URL -> SQLAlchemy async URL
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
 
 SQUADS = [
     {
-        "name": f"Отряд {number}",
+        "name": os.getenv(f"SQUAD_{number}_NAME", f"Отряд {number}"),
         "invite_link": os.getenv(f"SQUAD_{number}_LINK", "").strip(),
     }
     for number in range(1, SQUAD_COUNT + 1)
 ]
 
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+credentials = Credentials.from_service_account_info(
+    credentials_info,
+    scopes=SCOPES,
+)
+sheets_client = gspread.authorize(credentials)
+spreadsheet = sheets_client.open_by_key(GOOGLE_SHEET_ID)
+worksheet = spreadsheet.sheet1
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# One Railway replica should run this bot. The lock prevents two simultaneous
+# registrations from taking the same final place inside this process.
+registration_lock = asyncio.Lock()
+
 
 # ============================================================
-# DATABASE INITIALIZATION
+# GOOGLE SHEETS
+# Columns: A squad, B first name, C last name, D username, E Telegram ID.
 # ============================================================
 
-async def init_database():
-    # create_all does not delete or reset existing tables/data.
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def read_records():
+    values = worksheet.get_all_values()
+    if not values:
+        worksheet.append_row(HEADERS, value_input_option="RAW")
+        return []
 
-    async with SessionLocal() as session:
-        result = await session.execute(select(Squad).order_by(Squad.id))
-        squads = result.scalars().all()
+    current_headers = values[0][:5]
+    if current_headers != HEADERS:
+        raise RuntimeError(
+            "Google Sheet header mismatch. Expected columns A:E: "
+            + ", ".join(HEADERS)
+        )
 
-        # Create only missing squads. Existing participant assignments stay intact.
-        for index, squad_data in enumerate(SQUADS):
-            if index < len(squads):
-                squad = squads[index]
-                squad.name = squad_data["name"]
+    records = []
+    for row_number, row in enumerate(values[1:], start=2):
+        padded = row + [""] * (5 - len(row))
+        if any(str(value).strip() for value in padded[:5]):
+            records.append({
+                "row": row_number,
+                "squad": padded[0].strip(),
+                "first_name": padded[1].strip(),
+                "last_name": padded[2].strip(),
+                "username": padded[3].strip(),
+                "telegram_id": padded[4].strip(),
+            })
+    return records
 
-                # Empty Railway variables must not erase links already stored in DB.
-                if squad_data["invite_link"]:
-                    squad.invite_link = squad_data["invite_link"]
-            else:
-                session.add(
-                    Squad(
-                        name=squad_data["name"],
-                        invite_link=squad_data["invite_link"],
-                        members_count=0,
-                    )
-                )
 
-        # Recalculate counters from actual registrations to repair any old drift.
-        await session.flush()
-        participant_result = await session.execute(select(Participant.squad_id))
-        counts = {}
-        for squad_id in participant_result.scalars().all():
-            counts[squad_id] = counts.get(squad_id, 0) + 1
+def append_record(user: User, squad_name: str):
+    worksheet.append_row(
+        [
+            squad_name,
+            user.first_name or "",
+            user.last_name or "",
+            user.username or "",
+            str(user.id),
+        ],
+        value_input_option="RAW",
+    )
 
-        for squad in squads:
-            squad.members_count = counts.get(squad.id, 0)
 
-        await session.commit()
+def clear_records():
+    # Keep the header and formatting; remove participant data only.
+    worksheet.batch_clear(["A2:E"])
+
+
+def ensure_sheet_ready():
+    values = worksheet.get_all_values()
+    if not values:
+        worksheet.append_row(HEADERS, value_input_option="RAW")
+    elif values[0][:5] != HEADERS:
+        raise RuntimeError(
+            "Google Sheet header mismatch. Expected columns A:E: "
+            + ", ".join(HEADERS)
+        )
+
+
+async def get_records():
+    return await asyncio.to_thread(read_records)
+
+
+async def find_existing(telegram_id: int):
+    records = await get_records()
+    return next(
+        (record for record in records if record["telegram_id"] == str(telegram_id)),
+        None,
+    )
+
+
+def get_counts(records):
+    counts = {squad["name"]: 0 for squad in SQUADS}
+    for record in records:
+        if record["squad"] in counts:
+            counts[record["squad"]] += 1
+    return counts
+
+
+def available_squads(records):
+    counts = get_counts(records)
+    return [
+        squad for squad in SQUADS
+        if squad["invite_link"]
+        and counts[squad["name"]] < CAPACITY_PER_SQUAD
+    ]
 
 
 # ============================================================
@@ -104,25 +159,21 @@ async def init_database():
 # ============================================================
 
 def get_start_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Да, хочу выбрать", callback_data="choice:yes"),
-                InlineKeyboardButton(text="Нет, случайно", callback_data="choice:no"),
-            ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Да", callback_data="choice:yes"),
+            InlineKeyboardButton(text="Нет", callback_data="choice:no"),
         ]
-    )
+    ])
 
 
-def get_squads_keyboard(squads):
+def get_squads_keyboard(squads, counts):
     rows = []
-    for squad in squads:
-        rows.append([
-            InlineKeyboardButton(
-                text=f"🏕 {squad.name} · {squad.members_count}/{CAPACITY_PER_SQUAD}",
-                callback_data=f"choose:{squad.id}",
-            )
-        ])
+    for index, squad in enumerate(squads, start=1):
+        rows.append([InlineKeyboardButton(
+            text=f"🏕 {squad['name']} · {counts[squad['name']]}/{CAPACITY_PER_SQUAD}",
+            callback_data=f"choose:{SQUADS.index(squad) + 1}",
+        )])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="choice:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -135,35 +186,23 @@ def is_admin(user: User) -> bool:
     return bool(ADMIN_TELEGRAM_ID) and str(user.id) == str(ADMIN_TELEGRAM_ID)
 
 
-async def get_existing_assignment(session, telegram_id: int):
-    result = await session.execute(
-        select(Participant, Squad)
-        .join(Squad, Participant.squad_id == Squad.id)
-        .where(Participant.telegram_id == telegram_id)
-    )
-    return result.first()
-
-
-async def send_assignment(send, squad: Squad, already_assigned: bool = False):
-    name = html.escape(squad.name)
-    if squad.invite_link:
-        link = html.escape(squad.invite_link, quote=True)
-        link_line = f'🔗 <a href="{link}">Войти в чат отряда</a>'
-    else:
+async def send_assignment(send, squad, already_assigned=False):
+    name = html.escape(squad["name"])
+    link = squad["invite_link"]
+    if link:
         link_line = (
-            "⚠️ Ссылка на чат пока не настроена. "
-            "Обратись к организатору."
+            f'🔗 <a href="{html.escape(link, quote=True)}">'
+            "Войти в чат отряда</a>"
         )
-
-    if already_assigned:
-        heading = "✅ Ты уже закреплён за своим отрядом:"
     else:
-        heading = "🎉 Твой отряд:"
+        link_line = "⚠️ Ссылка на чат пока не настроена. Обратись к организатору."
 
+    heading = (
+        "✅ Ты уже закреплён за своим отрядом:"
+        if already_assigned else "🎉 Твой отряд:"
+    )
     await send(
-        f"{heading}\n\n"
-        f"🏕 <b>{name}</b>\n\n"
-        f"{link_line}\n\n"
+        f"{heading}\n\n🏕 <b>{name}</b>\n\n{link_line}\n\n"
         "Место закреплено за тобой. Повторное распределение не изменит отряд.",
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -171,86 +210,68 @@ async def send_assignment(send, squad: Squad, already_assigned: bool = False):
 
 
 async def show_existing_assignment(user: User, send) -> bool:
-    async with SessionLocal() as session:
-        existing = await get_existing_assignment(session, user.id)
-        if not existing:
+    async with registration_lock:
+        records = await get_records()
+        record = next(
+            (item for item in records if item["telegram_id"] == str(user.id)),
+            None,
+        )
+        if not record:
             return False
-        participant, squad = existing
-        # Keep the participant profile up to date without changing their squad.
-        participant.first_name = user.first_name or ""
-        participant.last_name = user.last_name or ""
-        participant.username = user.username or ""
-        await session.commit()
+
+        squad = next(
+            (item for item in SQUADS if item["name"] == record["squad"]),
+            None,
+        )
+        if not squad:
+            await send(
+                "Я нашёл твою запись в таблице, но не смог определить отряд. "
+                "Обратись к организатору."
+            )
+            return True
         await send_assignment(send, squad, already_assigned=True)
         return True
 
 
-async def get_available_squads(session, lock: bool = False):
-    query = select(Squad).order_by(Squad.id)
-    if lock:
-        query = query.with_for_update()
-    result = await session.execute(query)
-    squads = result.scalars().all()
-    # A squad without a configured chat link cannot be assigned yet.
-    return [
-        squad for squad in squads
-        if squad.members_count < CAPACITY_PER_SQUAD and squad.invite_link
-    ]
+async def assign_squad(user: User, send, squad_number=None):
+    async with registration_lock:
+        records = await get_records()
 
-
-async def assign_squad(user: User, send, squad_id: int | None = None):
-    # Fast idempotency check. The same check is repeated after acquiring locks.
-    if await show_existing_assignment(user, send):
-        return
-
-    async with SessionLocal() as session:
-        try:
-            # Lock all squad rows so concurrent users cannot take the last place
-            # in the same squad at the same time.
-            squads = await get_available_squads(session, lock=True)
-
-            existing = await get_existing_assignment(session, user.id)
-            if existing:
-                await session.rollback()
-                await send_assignment(send, existing[1], already_assigned=True)
-                return
-
-            if squad_id is not None:
-                selected = next((s for s in squads if s.id == squad_id), None)
-                if selected is None:
-                    await session.rollback()
-                    await send(
-                        "Это место уже заняли или отряд заполнен. "
-                        "Выбери другой свободный отряд.",
-                    )
-                    return
-            else:
-                if not squads:
-                    await session.rollback()
-                    await send("😔 Свободных мест больше нет. Все 10 отрядов заполнены.")
-                    return
-                selected = random.choice(squads)
-
-            participant = Participant(
-                telegram_id=user.id,
-                first_name=user.first_name or "",
-                last_name=user.last_name or "",
-                username=user.username or "",
-                squad_id=selected.id,
+        existing = next(
+            (item for item in records if item["telegram_id"] == str(user.id)),
+            None,
+        )
+        if existing:
+            squad = next(
+                (item for item in SQUADS if item["name"] == existing["squad"]),
+                None,
             )
-            session.add(participant)
-            selected.members_count += 1
-            await session.commit()
-
-            await send_assignment(send, selected)
-        except IntegrityError:
-            await session.rollback()
-            # A duplicate Telegram account registration should never change teams.
-            existing = await get_existing_assignment(session, user.id)
-            if existing:
-                await send_assignment(send, existing[1], already_assigned=True)
+            if squad:
+                await send_assignment(send, squad, already_assigned=True)
             else:
-                await send("Не получилось закрепить отряд. Попробуй ещё раз через минуту.")
+                await send("Твоя запись найдена, но отряд не распознан. Обратись к организатору.")
+            return
+
+        counts = get_counts(records)
+        available = available_squads(records)
+
+        if squad_number is not None:
+            if squad_number < 1 or squad_number > SQUAD_COUNT:
+                await send("Не удалось определить отряд. Нажми /start.")
+                return
+            selected = SQUADS[squad_number - 1]
+            if selected not in available:
+                await send("Этот отряд уже заполнен или ссылка не настроена. Выбери другой.")
+                return
+        else:
+            if not available:
+                await send("😔 Свободных мест больше нет. Все 10 отрядов заполнены.")
+                return
+            selected = random.choice(available)
+
+        # The row is the registration: capacity is reserved as soon as it is appended.
+        await asyncio.to_thread(append_record, user, selected["name"])
+        await send_assignment(send, selected)
 
 
 # ============================================================
@@ -261,10 +282,8 @@ async def assign_squad(user: User, send, squad_id: int | None = None):
 async def start_handler(message: Message):
     if await show_existing_assignment(message.from_user, message.answer):
         return
-
     await message.answer(
-        "Привет! 👋\n\n"
-        "Ты хочешь попасть в определённый отряд?",
+        "Привет! 👋\n\nТы хочешь попасть в определённый отряд?",
         reply_markup=get_start_keyboard(),
     )
 
@@ -275,16 +294,15 @@ async def choose_manually_callback(callback: CallbackQuery):
     if await show_existing_assignment(callback.from_user, callback.message.answer):
         return
 
-    async with SessionLocal() as session:
-        squads = await get_available_squads(session)
-
-    if not squads:
+    records = await get_records()
+    available = available_squads(records)
+    if not available:
         await callback.message.edit_text("😔 Свободных мест больше нет. Все 10 отрядов заполнены.")
         return
 
     await callback.message.edit_text(
         "Выбери отряд. Здесь отображаются только те, где ещё есть места:",
-        reply_markup=get_squads_keyboard(squads),
+        reply_markup=get_squads_keyboard(available, get_counts(records)),
     )
 
 
@@ -309,15 +327,14 @@ async def back_callback(callback: CallbackQuery):
 async def choose_squad_callback(callback: CallbackQuery):
     await callback.answer()
     try:
-        squad_id = int(callback.data.split(":", 1)[1])
+        squad_number = int(callback.data.split(":", 1)[1])
     except (ValueError, AttributeError):
         await callback.message.answer("Не удалось определить отряд. Нажми /start.")
         return
-
     await assign_squad(
         callback.from_user,
         callback.message.answer,
-        squad_id=squad_id,
+        squad_number=squad_number,
     )
 
 
@@ -341,20 +358,18 @@ async def admin_handler(message: Message):
         await message.answer("⛔ У тебя нет доступа к этой команде.")
         return
 
-    async with SessionLocal() as session:
-        result = await session.execute(select(Squad).order_by(Squad.id))
-        squads = result.scalars().all()
-        total = sum(s.members_count for s in squads)
-
-        lines = ["📊 <b>Статистика отрядов</b>", ""]
-        for squad in squads:
-            status = "🔒" if squad.members_count >= CAPACITY_PER_SQUAD else "🟢"
-            lines.append(
-                f"{status} {html.escape(squad.name)}: "
-                f"<b>{squad.members_count}/{CAPACITY_PER_SQUAD}</b>"
-            )
-        lines.extend(["", f"👥 Всего участников: <b>{total}/{SQUAD_COUNT * CAPACITY_PER_SQUAD}</b>"])
-        await message.answer("\n".join(lines), parse_mode="HTML")
+    records = await get_records()
+    counts = get_counts(records)
+    lines = ["📊 <b>Статистика отрядов</b>", ""]
+    for squad in SQUADS:
+        count = counts[squad["name"]]
+        status = "🔒" if count >= CAPACITY_PER_SQUAD else "🟢"
+        lines.append(
+            f"{status} {html.escape(squad['name'])}: "
+            f"<b>{count}/{CAPACITY_PER_SQUAD}</b>"
+        )
+    lines.extend(["", f"👥 Всего участников: <b>{len(records)}/{SQUAD_COUNT * CAPACITY_PER_SQUAD}</b>"])
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("reset"))
@@ -363,16 +378,11 @@ async def reset_handler(message: Message):
         await message.answer("⛔ У тебя нет доступа к этой команде.")
         return
 
-    async with SessionLocal() as session:
-        await session.execute(delete(Participant))
-        result = await session.execute(select(Squad))
-        for squad in result.scalars().all():
-            squad.members_count = 0
-        await session.commit()
-
+    async with registration_lock:
+        await asyncio.to_thread(clear_records)
     await message.answer(
         "♻️ Распределение очищено. Все 100 мест снова доступны. "
-        "Ссылки и настройки отрядов сохранены."
+        "Заголовки таблицы и настройки отрядов сохранены."
     )
 
 
@@ -407,15 +417,13 @@ async def fallback_handler(message: Message):
 # ============================================================
 
 async def main():
-    print("Starting bot...")
-    await init_database()
-    print("Database initialized.")
-    print("Bot is running.")
+    print("Starting bot with Google Sheets storage...")
+    await asyncio.to_thread(ensure_sheet_ready)
+    print("Google Sheet connected.")
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-        await engine.dispose()
 
 
 if __name__ == "__main__":
