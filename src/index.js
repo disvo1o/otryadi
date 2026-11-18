@@ -282,7 +282,7 @@ async function handleUpdate(env, update) {
   const user = message.from;
   const chatId = message.chat.id;
   const text = message.text || "";
-  const records = await readRecords();
+  const records = await readRecords(env);
 
   if (text.startsWith("/start") || text.startsWith("/team")) {
     if (await showExisting(env, user, chatId, records, squads)) return;
