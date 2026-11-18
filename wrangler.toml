@@ -1,0 +1,16 @@
+name = "otryadi"
+main = "src/index.js"
+compatibility_date = "2026-11-18"
+workers_dev = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[[durable_objects.bindings]]
+name = "OTRYADI_SERIALIZER"
+class_name = "OtryadiSerializer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OtryadiSerializer"]
